@@ -11,7 +11,10 @@
 (define-constant ERR_INVALID_CRITERIA (err u104))
 (define-constant ERR_AUTHORITY_NOT_FOUND (err u105))
 (define-constant ERR_AUTHORITY_SUSPENDED (err u106))
+(define-constant ERR_NO_RENEWAL_AVAILABLE (err u107))
 (define-constant CERTIFICATION_DURATION u52560)
+(define-constant RENEWAL_DISCOUNT_THRESHOLD u75)
+(define-constant RENEWAL_DISCOUNT_RATE u10)
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var certification-fee uint u1000000)
@@ -67,6 +70,28 @@
 (define-map farm-owner-lookup
   { owner: principal }
   { farm-ids: (list 50 uint) }
+)
+
+(define-map certification-history
+  { farm-id: uint, history-index: uint }
+  {
+    certification-id: uint,
+    authority: principal,
+    score: uint,
+    issued-at: uint,
+    expires-at: uint,
+    archived-at: uint
+  }
+)
+
+(define-map renewal-count
+  { farm-id: uint }
+  { count: uint }
+)
+
+(define-map cumulative-score
+  { farm-id: uint }
+  { total: uint }
 )
 
 (define-public (register-farm (name (string-ascii 64)) (location (string-ascii 128)) (size-hectares uint))
@@ -219,6 +244,70 @@
   )
 )
 
+(define-public (renew-certification (farm-id uint) (criteria-met (list 10 (string-ascii 32))) (score uint))
+  (let (
+    (farm (unwrap! (map-get? farms { farm-id: farm-id }) ERR_FARM_NOT_FOUND))
+    (existing-cert (unwrap! (map-get? certifications { farm-id: farm-id }) ERR_FARM_NOT_FOUND))
+    (authority (unwrap! (map-get? certification-authorities { authority: tx-sender }) ERR_AUTHORITY_NOT_FOUND))
+    (current-block burn-block-height)
+    (renewal-idx (default-to u0 (get count (map-get? renewal-count { farm-id: farm-id }))))
+    (cert-id (+ (var-get total-certifications) u1))
+    (discount (if (>= (get score existing-cert) RENEWAL_DISCOUNT_THRESHOLD) RENEWAL_DISCOUNT_RATE u0))
+    (renewal-cost (if (> discount u0) (- (var-get certification-fee) (/ (* (var-get certification-fee) discount) u100)) (var-get certification-fee)))
+  )
+    (asserts! (get accredited authority) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get suspended authority)) ERR_AUTHORITY_SUSPENDED)
+    (asserts! (get active farm) ERR_FARM_NOT_FOUND)
+    (asserts! (<= score u100) ERR_INVALID_CRITERIA)
+    (asserts! (>= (get expires-at existing-cert) current-block) ERR_NO_RENEWAL_AVAILABLE)
+    
+    (map-set certification-history
+      { farm-id: farm-id, history-index: renewal-idx }
+      {
+        certification-id: (get certification-id existing-cert),
+        authority: (get authority existing-cert),
+        score: (get score existing-cert),
+        issued-at: (get issued-at existing-cert),
+        expires-at: (get expires-at existing-cert),
+        archived-at: current-block
+      }
+    )
+    
+    (map-set renewal-count
+      { farm-id: farm-id }
+      { count: (+ renewal-idx u1) }
+    )
+    
+    (let ((current-cumulative (default-to u0 (get total (map-get? cumulative-score { farm-id: farm-id })))))
+      (map-set cumulative-score
+        { farm-id: farm-id }
+        { total: (+ current-cumulative score) }
+      )
+    )
+    
+    (map-set certifications
+      { farm-id: farm-id }
+      {
+        certification-id: cert-id,
+        authority: tx-sender,
+        criteria-met: criteria-met,
+        score: score,
+        issued-at: current-block,
+        expires-at: (+ current-block CERTIFICATION_DURATION),
+        valid: true
+      }
+    )
+    
+    (map-set certification-authorities
+      { authority: tx-sender }
+      (merge authority { certifications-issued: (+ (get certifications-issued authority) u1) })
+    )
+    
+    (var-set total-certifications cert-id)
+    (ok cert-id)
+  )
+)
+
 (define-read-only (get-farm (farm-id uint))
   (map-get? farms { farm-id: farm-id })
 )
@@ -275,6 +364,31 @@
   (if (> total-criteria u0)
     (/ (* criteria-count u100) total-criteria)
     u0
+  )
+)
+
+(define-read-only (get-renewal-count (farm-id uint))
+  (default-to u0 (get count (map-get? renewal-count { farm-id: farm-id })))
+)
+
+(define-read-only (get-cumulative-score (farm-id uint))
+  (default-to u0 (get total (map-get? cumulative-score { farm-id: farm-id })))
+)
+
+(define-read-only (get-certification-history (farm-id uint) (history-index uint))
+  (map-get? certification-history { farm-id: farm-id, history-index: history-index })
+)
+
+(define-read-only (calculate-renewal-cost (farm-id uint))
+  (match (map-get? certifications { farm-id: farm-id })
+    cert
+      (let ((discount (if (>= (get score cert) RENEWAL_DISCOUNT_THRESHOLD) RENEWAL_DISCOUNT_RATE u0)))
+        (if (> discount u0)
+          (- (var-get certification-fee) (/ (* (var-get certification-fee) discount) u100))
+          (var-get certification-fee)
+        )
+      )
+    (var-get certification-fee)
   )
 )
 
