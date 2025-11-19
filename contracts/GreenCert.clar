@@ -1,7 +1,7 @@
 ;; title: GreenCert
-;; version: 1.0.0
-;; summary: Sustainable Farming Certification Protocol
-;; description: A protocol for issuing and verifying on-chain certifications for farms that meet specific sustainability criteria.
+;; version: 2.0.0
+;; summary: Sustainable Farming Certification Protocol with RBAC & Multi-Signature Verification
+;; description: A protocol for issuing and verifying on-chain certifications for farms that meet specific sustainability criteria, enhanced with role-based access control, supervisor approval workflows, secondary authority verification, and comprehensive action logging.
 
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_NOT_AUTHORIZED (err u100))
@@ -12,9 +12,20 @@
 (define-constant ERR_AUTHORITY_NOT_FOUND (err u105))
 (define-constant ERR_AUTHORITY_SUSPENDED (err u106))
 (define-constant ERR_NO_RENEWAL_AVAILABLE (err u107))
+(define-constant ERR_NOT_SUPERVISOR (err u108))
+(define-constant ERR_PENDING_APPROVAL (err u109))
+(define-constant ERR_REQUIRES_SECONDARY (err u110))
+(define-constant ERR_ALREADY_VERIFIED (err u111))
+(define-constant ERR_NOT_SECONDARY_AUTHORITY (err u112))
 (define-constant CERTIFICATION_DURATION u52560)
 (define-constant RENEWAL_DISCOUNT_THRESHOLD u75)
 (define-constant RENEWAL_DISCOUNT_RATE u10)
+(define-constant SECONDARY_VERIFICATION_THRESHOLD u80)
+(define-constant ACTION_TYPE_ISSUE u1)
+(define-constant ACTION_TYPE_APPROVE u2)
+(define-constant ACTION_TYPE_VERIFY_SECONDARY u3)
+(define-constant ACTION_TYPE_REVOKE u4)
+(define-constant ACTION_TYPE_REJECT u5)
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var certification-fee uint u1000000)
@@ -94,6 +105,52 @@
   { total: uint }
 )
 
+(define-map supervisors
+  { supervisor: principal }
+  {
+    registered-at: uint,
+    active: bool
+  }
+)
+
+(define-map pending-certifications
+  { cert-pending-id: uint }
+  {
+    farm-id: uint,
+    authority: principal,
+    criteria-met: (list 10 (string-ascii 32)),
+    score: uint,
+    requested-at: uint,
+    requires-secondary: bool,
+    approved: bool,
+    rejected: bool
+  }
+)
+
+(define-map secondary-verifications
+  { cert-id: uint }
+  {
+    primary-authority: principal,
+    secondary-authority: principal,
+    verified: bool,
+    verified-at: uint
+  }
+)
+
+(define-map action-logs
+  { action-id: uint }
+  {
+    action-type: uint,
+    performer: principal,
+    farm-id: uint,
+    cert-id: uint,
+    block-height: uint
+  }
+)
+
+(define-data-var pending-cert-counter uint u0)
+(define-data-var action-log-counter uint u0)
+
 (define-public (register-farm (name (string-ascii 64)) (location (string-ascii 128)) (size-hectares uint))
   (let (
     (farm-id (+ (var-get total-farms) u1))
@@ -138,6 +195,33 @@
   )
 )
 
+(define-public (register-supervisor (supervisor principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (map-set supervisors
+      { supervisor: supervisor }
+      {
+        registered-at: burn-block-height,
+        active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (remove-supervisor (supervisor principal))
+  (let (
+    (sup-data (unwrap! (map-get? supervisors { supervisor: supervisor }) ERR_NOT_SUPERVISOR))
+  )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (map-set supervisors
+      { supervisor: supervisor }
+      (merge sup-data { active: false })
+    )
+    (ok true)
+  )
+)
+
 (define-public (issue-certification 
   (farm-id uint) 
   (criteria-met (list 10 (string-ascii 32))) 
@@ -147,7 +231,9 @@
     (farm (unwrap! (map-get? farms { farm-id: farm-id }) ERR_FARM_NOT_FOUND))
     (authority (unwrap! (map-get? certification-authorities { authority: tx-sender }) ERR_AUTHORITY_NOT_FOUND))
     (current-block burn-block-height)
-    (cert-id (+ (var-get total-certifications) u1))
+    (pending-id (+ (var-get pending-cert-counter) u1))
+    (requires-secondary (>= score SECONDARY_VERIFICATION_THRESHOLD))
+    (action-id (+ (var-get action-log-counter) u1))
   )
     (asserts! (get accredited authority) ERR_NOT_AUTHORIZED)
     (asserts! (not (get suspended authority)) ERR_AUTHORITY_SUSPENDED)
@@ -159,32 +245,41 @@
       true
     )
     
-    (map-set certifications
-      { farm-id: farm-id }
+    (map-set pending-certifications
+      { cert-pending-id: pending-id }
       {
-        certification-id: cert-id,
+        farm-id: farm-id,
         authority: tx-sender,
         criteria-met: criteria-met,
         score: score,
-        issued-at: current-block,
-        expires-at: (+ current-block CERTIFICATION_DURATION),
-        valid: true
+        requested-at: current-block,
+        requires-secondary: requires-secondary,
+        approved: false,
+        rejected: false
+      }
+    )
+
+    (map-set action-logs
+      { action-id: action-id }
+      {
+        action-type: ACTION_TYPE_ISSUE,
+        performer: tx-sender,
+        farm-id: farm-id,
+        cert-id: u0,
+        block-height: current-block
       }
     )
     
-    (map-set certification-authorities
-      { authority: tx-sender }
-      (merge authority { certifications-issued: (+ (get certifications-issued authority) u1) })
-    )
-    
-    (var-set total-certifications cert-id)
-    (ok cert-id)
+    (var-set pending-cert-counter pending-id)
+    (var-set action-log-counter action-id)
+    (ok pending-id)
   )
 )
 
 (define-public (revoke-certification (farm-id uint))
   (let (
     (cert (unwrap! (map-get? certifications { farm-id: farm-id }) ERR_FARM_NOT_FOUND))
+    (action-id (+ (var-get action-log-counter) u1))
   )
     (asserts! (or 
       (is-eq tx-sender (get authority cert))
@@ -195,6 +290,150 @@
       { farm-id: farm-id }
       (merge cert { valid: false })
     )
+    
+    (map-set action-logs
+      { action-id: action-id }
+      {
+        action-type: ACTION_TYPE_REVOKE,
+        performer: tx-sender,
+        farm-id: farm-id,
+        cert-id: (get certification-id cert),
+        block-height: burn-block-height
+      }
+    )
+    
+    (var-set action-log-counter action-id)
+    (ok true)
+  )
+)
+
+(define-public (approve-certification (pending-id uint))
+  (let (
+    (pending (unwrap! (map-get? pending-certifications { cert-pending-id: pending-id }) ERR_FARM_NOT_FOUND))
+    (farm (unwrap! (map-get? farms { farm-id: (get farm-id pending) }) ERR_FARM_NOT_FOUND))
+    (authority (unwrap! (map-get? certification-authorities { authority: (get authority pending) }) ERR_AUTHORITY_NOT_FOUND))
+    (current-block burn-block-height)
+    (cert-id (+ (var-get total-certifications) u1))
+    (action-id (+ (var-get action-log-counter) u1))
+  )
+    (asserts! (is-supervisor tx-sender) ERR_NOT_SUPERVISOR)
+    (asserts! (not (get rejected pending)) ERR_PENDING_APPROVAL)
+    (asserts! (not (get approved pending)) ERR_ALREADY_CERTIFIED)
+    
+    (map-set pending-certifications
+      { cert-pending-id: pending-id }
+      (merge pending { approved: true })
+    )
+    
+    (if (get requires-secondary pending)
+      (map-set secondary-verifications
+        { cert-id: cert-id }
+        {
+          primary-authority: (get authority pending),
+          secondary-authority: (var-get contract-owner),
+          verified: false,
+          verified-at: u0
+        }
+      )
+      true
+    )
+    
+    (map-set certifications
+      { farm-id: (get farm-id pending) }
+      {
+        certification-id: cert-id,
+        authority: (get authority pending),
+        criteria-met: (get criteria-met pending),
+        score: (get score pending),
+        issued-at: current-block,
+        expires-at: (+ current-block CERTIFICATION_DURATION),
+        valid: true
+      }
+    )
+    
+    (map-set certification-authorities
+      { authority: (get authority pending) }
+      (merge authority { certifications-issued: (+ (get certifications-issued authority) u1) })
+    )
+    
+    (map-set action-logs
+      { action-id: action-id }
+      {
+        action-type: ACTION_TYPE_APPROVE,
+        performer: tx-sender,
+        farm-id: (get farm-id pending),
+        cert-id: cert-id,
+        block-height: current-block
+      }
+    )
+    
+    (var-set total-certifications cert-id)
+    (var-set action-log-counter action-id)
+    (ok cert-id)
+  )
+)
+
+(define-public (reject-certification (pending-id uint))
+  (let (
+    (pending (unwrap! (map-get? pending-certifications { cert-pending-id: pending-id }) ERR_FARM_NOT_FOUND))
+    (action-id (+ (var-get action-log-counter) u1))
+  )
+    (asserts! (is-supervisor tx-sender) ERR_NOT_SUPERVISOR)
+    (asserts! (not (get rejected pending)) ERR_ALREADY_CERTIFIED)
+    (asserts! (not (get approved pending)) ERR_PENDING_APPROVAL)
+    
+    (map-set pending-certifications
+      { cert-pending-id: pending-id }
+      (merge pending { rejected: true })
+    )
+    
+    (map-set action-logs
+      { action-id: action-id }
+      {
+        action-type: ACTION_TYPE_REJECT,
+        performer: tx-sender,
+        farm-id: (get farm-id pending),
+        cert-id: u0,
+        block-height: burn-block-height
+      }
+    )
+    
+    (var-set action-log-counter action-id)
+    (ok true)
+  )
+)
+
+(define-public (verify-secondary-authority (cert-id uint) (farm-id uint))
+  (let (
+    (verification (unwrap! (map-get? secondary-verifications { cert-id: cert-id }) ERR_REQUIRES_SECONDARY))
+    (authority (unwrap! (map-get? certification-authorities { authority: tx-sender }) ERR_AUTHORITY_NOT_FOUND))
+    (cert (unwrap! (map-get? certifications { farm-id: farm-id }) ERR_FARM_NOT_FOUND))
+    (action-id (+ (var-get action-log-counter) u1))
+    (current-block burn-block-height)
+  )
+    (asserts! (is-eq (get certification-id cert) cert-id) ERR_INVALID_CRITERIA)
+    (asserts! (not (get verified verification)) ERR_ALREADY_VERIFIED)
+    (asserts! (get accredited authority) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get suspended authority)) ERR_AUTHORITY_SUSPENDED)
+    (asserts! (not (is-eq tx-sender (get primary-authority verification))) ERR_NOT_SECONDARY_AUTHORITY)
+    
+    (map-set secondary-verifications
+      { cert-id: cert-id }
+      (merge verification { secondary-authority: tx-sender, verified: true, verified-at: current-block })
+    )
+    
+    (map-set action-logs
+      { action-id: action-id }
+      {
+        action-type: ACTION_TYPE_VERIFY_SECONDARY,
+        performer: tx-sender,
+        farm-id: farm-id,
+        cert-id: cert-id,
+        block-height: current-block
+      }
+    )
+    
+    (var-set action-log-counter action-id)
     (ok true)
   )
 )
@@ -390,6 +629,29 @@
       )
     (var-get certification-fee)
   )
+)
+
+(define-read-only (is-supervisor (supervisor principal))
+  (match (map-get? supervisors { supervisor: supervisor })
+    sup (get active sup)
+    false
+  )
+)
+
+(define-read-only (get-pending-certification (pending-id uint))
+  (map-get? pending-certifications { cert-pending-id: pending-id })
+)
+
+(define-read-only (get-secondary-verification (cert-id uint))
+  (map-get? secondary-verifications { cert-id: cert-id })
+)
+
+(define-read-only (get-action-log (action-id uint))
+  (map-get? action-logs { action-id: action-id })
+)
+
+(define-read-only (is-secondary-verification-required (score uint))
+  (>= score SECONDARY_VERIFICATION_THRESHOLD)
 )
 
 (define-private (is-certification-expired (expires-at uint))
